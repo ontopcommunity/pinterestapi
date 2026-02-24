@@ -1,7 +1,9 @@
 const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
 
 module.exports = async (req, res) => {
-    // Cấu hình CORS
+    // 1. Cấu hình CORS
     res.setHeader('Access-Control-Allow-Credentials', true);
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
@@ -12,82 +14,111 @@ module.exports = async (req, res) => {
     }
 
     const { q } = req.query;
-    if (!q) return res.status(400).json({ success: false, message: 'Thiếu query' });
+    if (!q) {
+        return res.status(400).json({ 
+            success: false, 
+            message: 'Thiếu từ khóa. Ví dụ: /api?q=naruto' 
+        });
+    }
 
     try {
-        // ==================================================================
-        // ĐÃ ĐIỀN TỰ ĐỘNG TỪ ẢNH SỐ 4 CỦA BẠN
-        // Đây là chuỗi Cookie ghép từ: csrftoken + _b + sessionFunnel...
-        const MY_COOKIE = 'csrftoken=3fb389ccd0f495ca9aa44607fd508db4; _b="AZEyrqBftCJGO5l1ZVGYjpX+Sdzs2hGxFbqGoQoWQUIB82893hNmOmZMKuVTeJMiUm4="; sessionFunnelEventLogged=1;';
-        // ==================================================================
+        // --- BƯỚC 1: CHỌN USER-AGENT NGẪU NHIÊN ---
+        let userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+        try {
+            const filePath = path.join(__dirname, 'user-agents.txt');
+            if (fs.existsSync(filePath)) {
+                // Đọc file, lọc bỏ các dòng [source...] rác nếu có
+                const lines = fs.readFileSync(filePath, 'utf8')
+                    .split('\n')
+                    .map(l => l.replace(/\/g, '').trim()) // Xóa rác 
+                    .filter(l => l.length > 20); // Chỉ lấy dòng UA hợp lệ
+                
+                if (lines.length > 0) {
+                    userAgent = lines[Math.floor(Math.random() * lines.length)];
+                }
+            }
+        } catch (e) { 
+            console.error("Lỗi đọc UA:", e.message); 
+        }
 
-        // Đã lấy từ ảnh số 1 và 2 của bạn
-        const MY_CSRF_TOKEN = '3fb389ccd0f495ca9aa44607fd508db4';
-        const APP_VERSION = 'bf9ee36'; 
+        // --- BƯỚC 2: TẠO URL GOOGLE IMAGES ---
+        // Cú pháp: site:pinterest.com + từ khóa
+        const query = `site:pinterest.com ${q}`;
+        const googleUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}&tbm=isch&ie=UTF-8`;
 
-        const apiUrl = 'https://www.pinterest.com/resource/BaseSearchResource/get/';
-        
-        const dataPayload = JSON.stringify({
-            options: {
-                isPrefetch: false,
-                query: q,
-                scope: "pins",
-                no_fetch_context_on_resource: false
-            },
-            context: {}
-        });
-
-        const response = await axios.get(apiUrl, {
-            params: {
-                source_url: `/search/pins/?q=${encodeURIComponent(q)}`,
-                data: dataPayload,
-                _: Date.now()
-            },
+        // --- BƯỚC 3: GỬI REQUEST ---
+        const response = await axios.get(googleUrl, {
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Referer': 'https://www.pinterest.com/',
-                'X-Requested-With': 'XMLHttpRequest',
-                'Accept': 'application/json, text/javascript, */*; q=0.01',
-                
-                // Header xác thực (Từ ảnh của bạn)
-                'X-APP-VERSION': APP_VERSION,
-                'X-CSRFToken': MY_CSRF_TOKEN,
-                'X-Pinterest-AppState': 'active',
-                
-                // Cookie (Từ ảnh số 4)
-                'Cookie': MY_COOKIE
+                'User-Agent': userAgent,
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                // Header này giúp Google trả về phiên bản Desktop dễ parse hơn
+                'sec-ch-ua-platform': '"Windows"',
+                'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120"',
+                'sec-ch-ua-mobile': '?0'
             }
         });
 
-        const responseData = response.data;
-        const results = [];
+        const html = response.data;
 
-        if (responseData?.resource_response?.data?.results) {
-            const pins = responseData.resource_response.data.results;
+        // --- BƯỚC 4: TRÍCH XUẤT LINK ẢNH PINTEREST ---
+        // Google chứa link ảnh gốc trong các đoạn script JSON.
+        // Pattern tìm kiếm: "http...pinimg.com..." theo sau là các thông số kích thước
+        
+        // Regex này tìm các link bắt đầu bằng http, chứa pinimg.com và kết thúc bằng đuôi ảnh
+        // Nó quét trong toàn bộ source HTML của Google
+        const regex = /"(https:\/\/i\.pinimg\.com\/[^"]+?\.jpg)"/g;
+        
+        let matches;
+        const results = new Set();
+
+        while ((matches = regex.exec(html)) !== null) {
+            let url = matches[1];
             
-            pins.forEach(pin => {
-                if (pin.images?.orig?.url) {
-                    results.push(pin.images.orig.url);
-                } else if (pin.images?.['736x']?.url) {
-                    results.push(pin.images['736x'].url);
-                }
+            // Link lấy được từ Google JSON thường bị mã hóa unicode (\u003d)
+            // Ta cần decode lại cho chuẩn
+            url = JSON.parse(`"${url}"`); 
+
+            // Chỉ lấy ảnh chất lượng cao (originals hoặc 736x)
+            // Google thường lưu link ảnh gốc, ta ưu tiên lấy nó
+            if (!url.includes('s-media-cache')) { // Bỏ qua link cache cũ nếu có
+                 results.add(url);
+            }
+        }
+
+        // --- BƯỚC 5: XỬ LÝ NẾU KHÔNG CÓ KẾT QUẢ (FALLBACK) ---
+        // Nếu Regex trên trượt, thử Regex quét thô đơn giản hơn
+        if (results.size === 0) {
+            const simpleRegex = /https:\/\/i\.pinimg\.com\/[a-zA-Z0-9\/\-_]+\.jpg/g;
+            const simpleMatches = html.match(simpleRegex);
+            if (simpleMatches) {
+                simpleMatches.forEach(u => results.add(u));
+            }
+        }
+
+        const finalResults = Array.from(results);
+
+        // --- TRẢ VỀ JSON ---
+        if (finalResults.length > 0) {
+            return res.status(200).json({
+                success: true,
+                source: 'Google Images (site:pinterest.com)',
+                query: q,
+                count: finalResults.length,
+                images: finalResults
+            });
+        } else {
+            return res.status(404).json({
+                success: false,
+                message: 'Không tìm thấy ảnh nào từ Google. Có thể Google đang hiện Captcha với IP này.',
+                debug_ua: userAgent
             });
         }
 
-        return res.status(200).json({
-            success: true,
-            count: results.length,
-            query: q,
-            images: results
-        });
-
     } catch (error) {
-        return res.status(error.response?.status || 500).json({
-            success: false,
-            message: error.message,
-            // Nếu vẫn lỗi 403, nghĩa là Cookie trong ảnh 4 thiếu phần đăng nhập (_auth)
-            // Lúc đó bạn cần cuộn xuống trong danh sách cookie để tìm dòng "_auth" hoặc "_pinterest_sess"
-            hint: 'Nếu lỗi 403: Hãy kiểm tra lại ảnh danh sách Cookie, tìm dòng _auth hoặc _pinterest_sess và thêm vào.'
+        return res.status(500).json({ 
+            success: false, 
+            message: error.message 
         });
     }
 };
