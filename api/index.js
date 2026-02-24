@@ -1,6 +1,12 @@
 const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
+
+// Danh sách User-Agent "cứng" (Không cần file txt nữa)
+const USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0"
+];
 
 module.exports = async (req, res) => {
     // 1. Cấu hình CORS
@@ -15,94 +21,61 @@ module.exports = async (req, res) => {
 
     const { q } = req.query;
     if (!q) {
-        return res.status(400).json({ 
-            success: false, 
-            message: 'Thiếu từ khóa. Ví dụ: /api?q=naruto' 
-        });
+        return res.status(400).json({ success: false, message: 'Thiếu query (?q=)' });
     }
 
     try {
-        // --- BƯỚC 1: CHỌN USER-AGENT NGẪU NHIÊN ---
-        let userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-        try {
-            const filePath = path.join(__dirname, 'user-agents.txt');
-            if (fs.existsSync(filePath)) {
-                // Đọc file, lọc bỏ các dòng [source...] rác nếu có
-                const lines = fs.readFileSync(filePath, 'utf8')
-                    .split('\n')
-                    .map(l => l.replace(/\/g, '').trim()) // Xóa rác 
-                    .filter(l => l.length > 20); // Chỉ lấy dòng UA hợp lệ
-                
-                if (lines.length > 0) {
-                    userAgent = lines[Math.floor(Math.random() * lines.length)];
-                }
-            }
-        } catch (e) { 
-            console.error("Lỗi đọc UA:", e.message); 
-        }
+        // Chọn ngẫu nhiên UA
+        const userAgent = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 
-        // --- BƯỚC 2: TẠO URL GOOGLE IMAGES ---
-        // Cú pháp: site:pinterest.com + từ khóa
-        const query = `site:pinterest.com ${q}`;
-        const googleUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}&tbm=isch&ie=UTF-8`;
+        // 2. Tìm kiếm qua Google Images với cú pháp site:pinterest.com
+        // &tbm=isch : Chế độ tìm ảnh
+        // &gbv=1 : Chế độ Google cơ bản (ít Javascript, dễ cào hơn)
+        const googleUrl = `https://www.google.com/search?q=site:pinterest.com+${encodeURIComponent(q)}&tbm=isch&gbv=1`;
 
-        // --- BƯỚC 3: GỬI REQUEST ---
         const response = await axios.get(googleUrl, {
             headers: {
                 'User-Agent': userAgent,
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                // Header này giúp Google trả về phiên bản Desktop dễ parse hơn
-                'sec-ch-ua-platform': '"Windows"',
-                'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120"',
-                'sec-ch-ua-mobile': '?0'
+                'Referer': 'https://www.google.com/'
             }
         });
 
         const html = response.data;
-
-        // --- BƯỚC 4: TRÍCH XUẤT LINK ẢNH PINTEREST ---
-        // Google chứa link ảnh gốc trong các đoạn script JSON.
-        // Pattern tìm kiếm: "http...pinimg.com..." theo sau là các thông số kích thước
-        
-        // Regex này tìm các link bắt đầu bằng http, chứa pinimg.com và kết thúc bằng đuôi ảnh
-        // Nó quét trong toàn bộ source HTML của Google
-        const regex = /"(https:\/\/i\.pinimg\.com\/[^"]+?\.jpg)"/g;
-        
-        let matches;
         const results = new Set();
 
-        while ((matches = regex.exec(html)) !== null) {
-            let url = matches[1];
-            
-            // Link lấy được từ Google JSON thường bị mã hóa unicode (\u003d)
-            // Ta cần decode lại cho chuẩn
-            url = JSON.parse(`"${url}"`); 
+        // 3. Regex siêu đơn giản: Tìm mọi chuỗi bắt đầu bằng http... và chứa .pinimg.com
+        // Regex này bắt được cả link trong thẻ <img src="..."> lẫn link trong JSON
+        const regex = /https?:\/\/[^"' \s<>]*\.pinimg\.com\/[^"' \s<>]*\.(?:jpg|png|jpeg|webp)/gi;
+        
+        const matches = html.match(regex);
 
-            // Chỉ lấy ảnh chất lượng cao (originals hoặc 736x)
-            // Google thường lưu link ảnh gốc, ta ưu tiên lấy nó
-            if (!url.includes('s-media-cache')) { // Bỏ qua link cache cũ nếu có
-                 results.add(url);
-            }
-        }
+        if (matches) {
+            matches.forEach(url => {
+                // Làm sạch URL (Google hay mã hóa \u003d hoặc \x3d)
+                let cleanUrl = url.replace(/\\u003d/g, '=').replace(/\\/g, '');
 
-        // --- BƯỚC 5: XỬ LÝ NẾU KHÔNG CÓ KẾT QUẢ (FALLBACK) ---
-        // Nếu Regex trên trượt, thử Regex quét thô đơn giản hơn
-        if (results.size === 0) {
-            const simpleRegex = /https:\/\/i\.pinimg\.com\/[a-zA-Z0-9\/\-_]+\.jpg/g;
-            const simpleMatches = html.match(simpleRegex);
-            if (simpleMatches) {
-                simpleMatches.forEach(u => results.add(u));
-            }
+                // Chỉ lấy ảnh, bỏ qua các icon nhỏ hoặc ảnh profile
+                if (!cleanUrl.includes('75x75') && !cleanUrl.includes('30x30')) {
+                    // Mẹo: Google thường trả về link ảnh nhỏ (tbn:...) hoặc ảnh cache
+                    // Ta cố gắng convert nó về dạng gốc của Pinterest nếu có thể
+                    
+                    // Nếu link chứa /xxx/ (kích thước), thay bằng /originals/
+                    if (cleanUrl.match(/\/\d+x\//)) {
+                        cleanUrl = cleanUrl.replace(/\/\d+x\//, '/originals/');
+                    }
+                    
+                    results.add(cleanUrl);
+                }
+            });
         }
 
         const finalResults = Array.from(results);
 
-        // --- TRẢ VỀ JSON ---
         if (finalResults.length > 0) {
             return res.status(200).json({
                 success: true,
-                source: 'Google Images (site:pinterest.com)',
+                source: 'google_search_basic',
                 query: q,
                 count: finalResults.length,
                 images: finalResults
@@ -110,15 +83,18 @@ module.exports = async (req, res) => {
         } else {
             return res.status(404).json({
                 success: false,
-                message: 'Không tìm thấy ảnh nào từ Google. Có thể Google đang hiện Captcha với IP này.',
-                debug_ua: userAgent
+                message: 'Không tìm thấy ảnh (Google chặn hoặc không có kết quả).',
             });
         }
 
     } catch (error) {
-        return res.status(500).json({ 
-            success: false, 
-            message: error.message 
+        // Bắt lỗi toàn cục để Server không bao giờ crash (500)
+        console.error(error);
+        return res.status(200).json({ // Trả về 200 kèm thông báo lỗi để frontend không sập
+            success: false,
+            message: 'Lỗi hệ thống đã được xử lý',
+            error_detail: error.message
         });
     }
 };
+
