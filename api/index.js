@@ -1,81 +1,132 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
+const fs = require('fs');
+const path = require('path');
 
 module.exports = async (req, res) => {
-    // 1. Cấu hình CORS (Để web khác gọi vào được)
+    // 1. Cấu hình CORS để cho phép mọi nguồn truy cập
     res.setHeader('Access-Control-Allow-Credentials', true);
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+    res.setHeader(
+        'Access-Control-Allow-Headers',
+        'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version'
+    );
 
-    // 2. Lấy từ khóa từ URL (ví dụ: ?q=mèo cute)
+    // Xử lý request OPTIONS (Preflight)
+    if (req.method === 'OPTIONS') {
+        res.status(200).end();
+        return;
+    }
+
+    // 2. Lấy tham số tìm kiếm từ URL
     const { q } = req.query;
 
     if (!q) {
         return res.status(400).json({ 
             success: false, 
-            message: 'Vui lòng nhập từ khóa! Ví dụ: /api?q=anime wallpaper' 
+            message: 'Thiếu từ khóa tìm kiếm. Vui lòng dùng: /api?q=từ_khóa_của_bạn' 
         });
     }
 
     try {
-        // --- QUAN TRỌNG: MÃ HÓA TỪ KHÓA ---
-        // encodeURIComponent sẽ đổi "mèo cute" thành "m%C3%A8o%20cute"
-        // Giúp Pinterest hiểu được tiếng Việt và khoảng trắng
+        // --- BẮT ĐẦU: XỬ LÝ USER AGENT ---
+        // Biến chứa User-Agent mặc định phòng trường hợp lỗi đọc file
+        let userAgentToUse = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+        try {
+            // Định vị file user-agents.txt trong cùng thư mục api
+            const filePath = path.join(__dirname, 'user-agents.txt');
+            
+            if (fs.existsSync(filePath)) {
+                // Đọc file
+                const fileContent = fs.readFileSync(filePath, 'utf8');
+                
+                // Chuyển nội dung thành mảng, lọc bỏ dòng trống
+                const agents = fileContent
+                    .split('\n')
+                    .map(line => line.trim())
+                    .filter(line => line && line.length > 10); // Lọc dòng quá ngắn hoặc rỗng
+
+                if (agents.length > 0) {
+                    // Chọn ngẫu nhiên 1 User-Agent
+                    const randomIndex = Math.floor(Math.random() * agents.length);
+                    userAgentToUse = agents[randomIndex];
+                }
+            }
+        } catch (fileError) {
+            console.error("Lỗi đọc file User-Agent:", fileError);
+            // Nếu lỗi vẫn dùng userAgentToUse mặc định
+        }
+        // --- KẾT THÚC: XỬ LÝ USER AGENT ---
+
+        // 3. Mã hóa từ khóa (xử lý dấu cách, tiếng Việt)
         const encodedQuery = encodeURIComponent(q);
-        
+        // URL Search của Pinterest
         const searchUrl = `https://www.pinterest.com/search/pins/?q=${encodedQuery}&rs=typed`;
 
-        // 3. Giả lập trình duyệt (Headers)
-        const headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Referer': 'https://www.pinterest.com/',
-        };
+        // 4. Gọi request tới Pinterest
+        const response = await axios.get(searchUrl, {
+            headers: {
+                'User-Agent': userAgentToUse,
+                'Referer': 'https://www.pinterest.com/',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5'
+            }
+        });
 
-        const { data } = await axios.get(searchUrl, { headers });
-        const $ = cheerio.load(data);
+        // 5. Phân tích HTML trả về
+        const html = response.data;
+        const $ = cheerio.load(html);
 
-        // 4. Lấy dữ liệu JSON ẩn trong thẻ script
+        // Lấy dữ liệu JSON từ thẻ script id="__PWS_DATA__"
         const scriptData = $('#__PWS_DATA__').html();
+
         if (!scriptData) {
-            return res.status(500).json({ success: false, message: 'Pinterest chặn hoặc không tìm thấy dữ liệu.' });
+            return res.status(500).json({ 
+                success: false, 
+                message: 'Pinterest chặn truy cập hoặc không tìm thấy dữ liệu.',
+                debug_ua: userAgentToUse // Trả về để kiểm tra xem đã dùng UA nào
+            });
         }
 
         const jsonData = JSON.parse(scriptData);
         const results = [];
 
-        // 5. Đào dữ liệu trong cấu trúc JSON của Pinterest
-        // Cấu trúc: props -> initialReduxState -> feeds -> [search_results_...]
+        // 6. Trích xuất dữ liệu ảnh từ JSON
+        // Đường dẫn: props -> initialReduxState -> feeds
         const feeds = jsonData.props.initialReduxState.feeds;
-        
+
         if (feeds) {
-            // Pinterest tạo key động cho kết quả search, thường chứa chữ "search_results"
+            // Tìm key chứa kết quả search (thường có dạng search_results_...)
             const searchKey = Object.keys(feeds).find(key => key.includes('search_results'));
-            
+
             if (searchKey && feeds[searchKey].results) {
                 const pins = feeds[searchKey].results;
 
                 pins.forEach(pin => {
-                    // Chỉ lấy item là ảnh (có key images và orig)
+                    // Kiểm tra xem item có phải là ảnh không (có key images.orig)
                     if (pin.images && pin.images.orig) {
-                        results.push(pin.images.orig.url); // Chỉ lấy link ảnh gốc
+                        results.push(pin.images.orig.url);
                     }
                 });
             }
         }
 
-        // Trả về kết quả
+        // 7. Trả về kết quả JSON
         return res.status(200).json({
             success: true,
-            query: q,           // Từ khóa gốc
-            encoded_query: encodedQuery, // Từ khóa đã mã hóa (để bạn kiểm tra)
+            query: q,
             count: results.length,
-            images: results     // Mảng chứa danh sách link ảnh
+            images: results
         });
 
     } catch (error) {
+        // Xử lý lỗi hệ thống
         return res.status(500).json({ 
             success: false, 
-            message: error.message 
+            message: error.message,
+            stack: error.stack
         });
     }
 };
