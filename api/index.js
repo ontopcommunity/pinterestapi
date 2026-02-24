@@ -23,31 +23,24 @@ module.exports = async (req, res) => {
     if (!q) {
         return res.status(400).json({ 
             success: false, 
-            message: 'Thiếu từ khóa tìm kiếm. Vui lòng dùng: /api?q=từ_khóa' 
+            message: 'Thiếu từ khóa tìm kiếm. Vui lòng dùng: /api?q=anime' 
         });
     }
 
     try {
-        // --- XỬ LÝ USER AGENT ---
+        // --- RANDOM USER AGENT ---
         let userAgentToUse = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
         try {
             const filePath = path.join(__dirname, 'user-agents.txt');
             if (fs.existsSync(filePath)) {
                 const fileContent = fs.readFileSync(filePath, 'utf8');
-                const agents = fileContent
-                    .split('\n')
-                    .map(line => line.trim())
-                    .filter(line => line && line.length > 10);
-
+                const agents = fileContent.split('\n').map(line => line.trim()).filter(line => line.length > 10);
                 if (agents.length > 0) {
-                    const randomIndex = Math.floor(Math.random() * agents.length);
-                    userAgentToUse = agents[randomIndex];
+                    userAgentToUse = agents[Math.floor(Math.random() * agents.length)];
                 }
             }
-        } catch (e) {
-            console.error("Lỗi đọc file UA:", e);
-        }
+        } catch (e) { console.error(e); }
 
         const encodedQuery = encodeURIComponent(q);
         const searchUrl = `https://www.pinterest.com/search/pins/?q=${encodedQuery}&rs=typed`;
@@ -57,80 +50,79 @@ module.exports = async (req, res) => {
             headers: {
                 'User-Agent': userAgentToUse,
                 'Referer': 'https://www.pinterest.com/',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Cache-Control': 'no-cache',
-                'Pragma': 'no-cache'
+                // Header này quan trọng để lấy được HTML đầy đủ hơn
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
             }
         });
 
         const html = response.data;
         const $ = cheerio.load(html);
-        let results = [];
+        let results = new Set(); // Dùng Set để tự động lọc trùng
         let methodUsed = '';
 
-        // --- CÁCH 1: PARSE JSON CHUẨN (ƯU TIÊN) ---
+        // --- CÁCH 1: JSON PARSER (Thử trước) ---
         try {
             const scriptData = $('#__PWS_DATA__').html();
             if (scriptData) {
                 const jsonData = JSON.parse(scriptData);
-                
-                // Kiểm tra an toàn từng lớp dữ liệu để tránh lỗi "undefined"
-                if (jsonData && jsonData.props && jsonData.props.initialReduxState && jsonData.props.initialReduxState.feeds) {
-                    const feeds = jsonData.props.initialReduxState.feeds;
-                    const searchKey = Object.keys(feeds).find(key => key.includes('search_results'));
-                    
-                    if (searchKey && feeds[searchKey].results) {
-                        const pins = feeds[searchKey].results;
-                        pins.forEach(pin => {
-                            if (pin.images && pin.images.orig) {
-                                results.push(pin.images.orig.url);
-                            }
-                        });
-                        methodUsed = 'json_parser';
-                    }
+                // Đào sâu vào cấu trúc dữ liệu nếu tồn tại
+                const feeds = jsonData?.props?.initialReduxState?.feeds;
+                if (feeds) {
+                    Object.values(feeds).forEach(feed => {
+                        if (feed.results && Array.isArray(feed.results)) {
+                            feed.results.forEach(pin => {
+                                if (pin.images?.orig?.url) {
+                                    results.add(pin.images.orig.url);
+                                }
+                            });
+                        }
+                    });
                 }
             }
-        } catch (parseError) {
-            console.log("JSON Parse Error, switching to Regex...", parseError.message);
+        } catch (e) {
+            console.log("JSON Parse failed, switching to Regex fallback");
         }
 
-        // --- CÁCH 2: REGEX FALLBACK (DỰ PHÒNG MẠNH MẼ) ---
-        // Nếu cách 1 thất bại hoặc không tìm thấy ảnh nào, dùng Regex quét toàn bộ HTML
-        if (results.length === 0) {
-            // Regex tìm tất cả link bắt đầu bằng https://i.pinimg.com/originals/ và kết thúc bằng đuôi ảnh
-            const regex = /https:\/\/i\.pinimg\.com\/originals\/[a-zA-Z0-9\/\-_]+\.(?:jpg|png|webp|jpeg)/g;
-            const foundMatches = html.match(regex);
+        // --- CÁCH 2: SMART REGEX SCAN (Chạy nếu Cách 1 ít kết quả) ---
+        // Nếu cách 1 tìm được ít hơn 5 ảnh, ta kích hoạt quét thô HTML
+        if (results.size < 5) {
+            methodUsed = 'smart_regex';
             
-            if (foundMatches) {
-                // Loại bỏ trùng lặp bằng Set
-                results = [...new Set(foundMatches)];
-                methodUsed = 'regex_fallback';
+            // Regex này tìm TẤT CẢ các size ảnh (236x, 474x, 564x, 736x, originals)
+            // Loại bỏ các ảnh avatar (thường có /75x75_RS/ hoặc /30x30_RS/)
+            const regex = /https:\/\/i\.pinimg\.com\/(?:originals|236x|474x|564x|736x)\/[a-zA-Z0-9\/\-_]+\.(?:jpg|png|webp|jpeg)/g;
+            
+            const matches = html.match(regex);
+            
+            if (matches) {
+                matches.forEach(url => {
+                    // Bỏ qua ảnh avatar nhỏ (thường chứa _RS hoặc link quá ngắn)
+                    if (!url.includes('75x75_RS') && !url.includes('30x30_RS')) {
+                        // Kỹ thuật: Thay thế mọi kích thước thành /originals/ để lấy ảnh nét nhất
+                        const hdUrl = url.replace(/\/(?:236x|474x|564x|736x)\//, '/originals/');
+                        results.add(hdUrl);
+                    }
+                });
             }
+        } else {
+            methodUsed = 'json_parser';
         }
 
-        // Trả về kết quả
-        if (results.length > 0) {
-            return res.status(200).json({
-                success: true,
-                method: methodUsed, // Cho biết đã dùng cách nào để lấy ảnh
-                query: q,
-                count: results.length,
-                images: results
-            });
-        } else {
-            return res.status(404).json({
-                success: false,
-                message: 'Không tìm thấy ảnh nào. Pinterest có thể đã chặn IP hoặc thay đổi cấu trúc.',
-                debug_ua: userAgentToUse
-            });
-        }
+        // Chuyển Set thành Array
+        const finalResults = Array.from(results);
+
+        return res.status(200).json({
+            success: true,
+            method: methodUsed,
+            query: q,
+            count: finalResults.length,
+            images: finalResults
+        });
 
     } catch (error) {
         return res.status(500).json({ 
             success: false, 
-            message: error.message,
-            stack: error.stack 
+            message: error.message
         });
     }
 };
