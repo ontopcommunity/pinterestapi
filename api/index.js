@@ -1,6 +1,4 @@
 const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
 
 module.exports = async (req, res) => {
     // 1. Cấu hình CORS
@@ -17,122 +15,89 @@ module.exports = async (req, res) => {
     if (!q) return res.status(400).json({ success: false, message: 'Thiếu query (?q=)' });
 
     try {
-        // --- RANDOM USER AGENT ---
-        let userAgentToUse = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-        try {
-            const filePath = path.join(__dirname, 'user-agents.txt');
-            if (fs.existsSync(filePath)) {
-                const lines = fs.readFileSync(filePath, 'utf8').split('\n').filter(l => l.length > 10);
-                if (lines.length > 0) userAgentToUse = lines[Math.floor(Math.random() * lines.length)];
-            }
-        } catch (e) {}
-
-        const encodedQuery = encodeURIComponent(q);
+        // --- CẤU HÌNH ---
+        // Token lấy từ ảnh của bạn
+        const myCsrfToken = '3fb389ccd0f495ca9aa44607fd508db4';
         
-        // MẸO 1: Dùng domain phụ (ca.pinterest.com hoặc uk) để tránh rate limit của server chính
-        const searchUrl = `https://ca.pinterest.com/search/pins/?q=${encodedQuery}&rs=typed`;
+        // Gọi thẳng vào API nội bộ của Pinterest (Không gọi trang web HTML nữa)
+        // Đây là API mà Pinterest dùng để tải thêm ảnh khi bạn lướt web
+        const apiUrl = 'https://www.pinterest.com/resource/BaseSearchResource/get/';
 
-        // MẸO 2: Giả lập Cookie của người dùng mới (Guest)
-        // Pinterest sẽ chặn nếu không có cookie, nhưng sẽ nới lỏng nếu có cookie "_auth=0"
-        const response = await axios.get(searchUrl, {
-            headers: {
-                'User-Agent': userAgentToUse,
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Referer': 'https://ca.pinterest.com/',
-                'Cookie': 'pw_loc=ca; _auth=0; _pinterest_sess=;', // Cookie giả lập guest
-                'Cache-Control': 'no-cache',
-                'Pragma': 'no-cache'
+        // Payload dữ liệu bắt buộc phải có
+        const dataPayload = JSON.stringify({
+            options: {
+                isPrefetch: false,
+                query: q,
+                scope: "pins",
+                no_fetch_context_on_resource: false
             },
-            validateStatus: () => true // Không ném lỗi nếu gặp 403, để ta xử lý bên dưới
+            context: {}
         });
 
-        if (response.status === 403 || response.status === 429) {
-            return res.status(403).json({
-                success: false,
-                message: 'Pinterest chặn IP Vercel. Giải pháp: Bạn cần tự lấy Cookie trình duyệt của mình dán vào code (Xem hướng dẫn bên dưới).',
-                error_code: response.status
-            });
-        }
-
-        const html = response.data;
-        let results = new Set();
-
-        // --- CÁCH 1: QUÉT JSON (HIỆU QUẢ NHẤT) ---
-        // Pinterest giấu dữ liệu trong thẻ script id="__PWS_DATA__"
-        // Ta dùng Regex để trích xuất JSON này ra mà không cần parse toàn bộ HTML
-        const jsonMatch = html.match(/<script id="__PWS_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
-        
-        if (jsonMatch && jsonMatch[1]) {
-            try {
-                const jsonData = JSON.parse(jsonMatch[1]);
-                const feeds = jsonData?.props?.initialReduxState?.feeds;
+        // 2. GỬI REQUEST GIẢ LẬP
+        const response = await axios.get(apiUrl, {
+            params: {
+                source_url: `/search/pins/?q=${encodeURIComponent(q)}`,
+                data: dataPayload,
+                _: Date.now()
+            },
+            headers: {
+                // Giả lập trình duyệt
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Referer': 'https://www.pinterest.com/',
+                'X-Requested-With': 'XMLHttpRequest',
+                'Accept': 'application/json, text/javascript, */*; q=0.01',
                 
-                if (feeds) {
-                    // Tìm tất cả các key chứa dữ liệu feed
-                    Object.keys(feeds).forEach(key => {
-                        const feed = feeds[key];
-                        if (feed.results && Array.isArray(feed.results)) {
-                            feed.results.forEach(pin => {
-                                // Chỉ lấy các item là ảnh (bỏ qua user/board/quảng cáo)
-                                if (pin.images?.orig?.url) {
-                                    results.add(pin.images.orig.url);
-                                } else if (pin.images?.['736x']?.url) {
-                                    results.add(pin.images['736x'].url);
-                                }
-                            });
-                        }
-                    });
-                }
-            } catch (e) {
-                console.log("JSON Parse Error");
+                // --- MẤU CHỐT Ở ĐÂY ---
+                // CSRF Token phải có mặt ở cả trong Header và Cookie thì API mới nhận
+                'X-CSRF-Token': myCsrfToken,
+                'Cookie': `csrftoken=${myCsrfToken};` 
             }
-        }
+        });
 
-        // --- CÁCH 2: QUÉT LINK ẢNH TRỰC TIẾP (DỰ PHÒNG) ---
-        // Nếu JSON thất bại, quét thô toàn bộ HTML tìm link ảnh
-        if (results.size < 2) {
-            // Regex tìm link ảnh có định dạng Pinterest
-            const urlRegex = /https:\/\/i\.pinimg\.com\/(?:originals|236x|474x|564x|736x)\/[a-zA-Z0-9\/\-_]+\.(?:jpg|png|webp|jpeg)/g;
-            const matches = html.match(urlRegex);
+        // 3. XỬ LÝ KẾT QUẢ (JSON)
+        // API này trả về JSON sạch, không cần parse HTML
+        const responseData = response.data;
+        const results = [];
+
+        // Kiểm tra xem dữ liệu nằm ở đâu (Pinterest đôi khi đổi cấu trúc)
+        if (responseData?.resource_response?.data?.results) {
+            const pins = responseData.resource_response.data.results;
             
-            if (matches) {
-                matches.forEach(url => {
-                    // LỌC RÁC: Bỏ ảnh avatar, logo, icon nhỏ
-                    if (!url.includes('75x75') && 
-                        !url.includes('30x30') && 
-                        !url.includes('profile_') && 
-                        !url.includes('user_') &&
-                        !url.includes('favicon')) {
-                        
-                        // Ép về ảnh gốc (HD)
-                        const hdUrl = url.replace(/\/\d+x\//, '/originals/');
-                        results.add(hdUrl);
-                    }
-                });
-            }
-        }
-
-        const finalResults = Array.from(results);
-
-        if (finalResults.length === 0) {
-            // Trường hợp xấu nhất: Login Wall chặn hết
-            return res.status(200).json({ // Trả về 200 nhưng rỗng để không crash app
-                success: true,
-                message: 'Login Wall Blocked. Vui lòng thử lại sau vài giây hoặc đổi từ khóa.',
-                count: 0,
-                images: []
+            pins.forEach(pin => {
+                // Logic lấy ảnh chất lượng cao nhất
+                if (pin.images?.orig?.url) {
+                    results.push(pin.images.orig.url);
+                } else if (pin.images?.['736x']?.url) {
+                    results.push(pin.images['736x'].url);
+                }
             });
         }
 
-        return res.status(200).json({
-            success: true,
-            query: q,
-            count: finalResults.length,
-            images: finalResults
-        });
+        // 4. TRẢ VỀ
+        if (results.length > 0) {
+            return res.status(200).json({
+                success: true,
+                method: 'internal_api_with_token',
+                count: results.length,
+                query: q,
+                images: results
+            });
+        } else {
+            return res.status(404).json({
+                success: false,
+                message: 'Không tìm thấy ảnh. Có thể token đã hết hạn hoặc cần thêm Cookie phiên đăng nhập (_pinterest_sess).',
+                debug: responseData // Trả về để xem lỗi gì nếu có
+            });
+        }
 
     } catch (error) {
-        return res.status(500).json({ success: false, message: error.message });
+        // Xử lý lỗi 403 hoặc lỗi mạng
+        return res.status(500).json({
+            success: false,
+            message: error.message,
+            stack: error.stack
+        });
     }
 };
+
